@@ -48,7 +48,9 @@ export const ASSET_REGISTRY: Record<string, RegisteredAsset> = {
     name: 'Ondo US Dollar Yield',
     issuerName: 'Ondo Finance',
     homeDomain: 'ondo.finance',
-    network: 'all',
+    // Mainnet only: this issuer account does not exist on testnet, so a
+    // changeTrust there fails with op_no_issuer.
+    network: 'mainnet',
     kind: 'treasury',
     reserveXlm: 0.5,
   },
