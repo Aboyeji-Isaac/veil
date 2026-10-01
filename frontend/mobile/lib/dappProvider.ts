@@ -28,7 +28,14 @@ export type DappProviderResponse =
 
 export type SigningPrompt = {
   origin: string;
-  operation: 'Sign transaction' | 'Sign auth entry';
+  request: 'Sign transaction' | 'Sign auth entry';
+  operation: string;
+  asset: string;
+  amount: string;
+};
+
+export type SigningDescription = {
+  operation: string;
   asset: string;
   amount: string;
 };
@@ -41,7 +48,7 @@ export type ProviderDependencies = {
   getAddress: () => Promise<string | null>;
   signXdr: (xdrString: string) => Promise<string>;
   requestApproval: (prompt: SigningPrompt) => Promise<boolean>;
-  describeXdr?: (xdrString: string) => { asset: string; amount: string };
+  describeXdr?: (xdrString: string) => SigningDescription | null;
 };
 
 function responseError(id: string, code: string, message: string): DappProviderResponse {
@@ -146,51 +153,79 @@ function knownSacLabel(contractId: string): string | null {
  * Derive value-moving metadata from the signed XDR. Page-supplied labels are
  * never trusted. Unknown contracts stay visibly unknown in the approval UI.
  */
-export function describeSigningXdr(xdrString: string): { asset: string; amount: string } {
+export function describeSigningXdr(xdrString: string): SigningDescription | null {
   const network = getNetwork();
   const parsed = TransactionBuilder.fromXDR(xdrString, network.networkPassphrase);
-  const tx = 'operations' in parsed ? parsed : parsed.innerTransaction;
+  const tx = 'innerTransaction' in parsed ? parsed.innerTransaction : parsed;
 
-  for (const operation of tx.operations) {
-    if (operation.type === 'payment') {
-      return { asset: labelClassicAsset(operation.asset), amount: operation.amount };
-    }
+  // A single native prompt must describe the whole thing the user is about to
+  // authorise. Multiple operations cannot be reduced to one asset/amount pair
+  // without hiding information, so refuse them instead of summarising loosely.
+  if (tx.operations.length !== 1) return null;
+  const operation = tx.operations[0]!;
 
-    if (
-      operation.type === 'invokeHostFunction' &&
-      operation.func.switch().value ===
-        xdr.HostFunctionType.hostFunctionTypeInvokeContract().value
-    ) {
-      const invocation = operation.func.invokeContract();
-      if (invocation.functionName().toString() !== 'transfer') continue;
-
-      const contractId = Address.fromScAddress(invocation.contractAddress()).toString();
-      const args = invocation.args();
-      const raw = args.length >= 3 ? scValToNative(args[2]!) : null;
-      const amount =
-        typeof raw === 'bigint'
-          ? raw
-          : typeof raw === 'number' && Number.isSafeInteger(raw)
-            ? BigInt(raw)
-            : null;
-      const known = knownSacLabel(contractId);
-
-      return {
-        asset: known ?? `Contract ${shortAddress(contractId)}`,
-        amount:
-          amount === null
-            ? 'Unable to decode'
-            : known
-              ? formatStroops(amount)
-              : `${amount.toString()} raw units`,
-      };
-    }
+  if (operation.type === 'payment') {
+    return {
+      operation: 'Payment',
+      asset: labelClassicAsset(operation.asset),
+      amount: operation.amount,
+    };
   }
 
-  return {
-    asset: 'No value transfer detected',
-    amount: 'No value transfer detected',
-  };
+  if (operation.type === 'createAccount') {
+    return {
+      operation: 'Create account',
+      asset: 'XLM',
+      amount: operation.startingBalance,
+    };
+  }
+
+  if (operation.type === 'pathPaymentStrictSend') {
+    return {
+      operation: 'Path payment (send)',
+      asset: labelClassicAsset(operation.sendAsset),
+      amount: operation.sendAmount,
+    };
+  }
+
+  if (operation.type === 'pathPaymentStrictReceive') {
+    return {
+      operation: 'Path payment (maximum send)',
+      asset: labelClassicAsset(operation.sendAsset),
+      amount: operation.sendMax,
+    };
+  }
+
+  if (
+    operation.type === 'invokeHostFunction' &&
+    operation.func.switch().value ===
+      xdr.HostFunctionType.hostFunctionTypeInvokeContract().value
+  ) {
+    const invocation = operation.func.invokeContract();
+    if (invocation.functionName().toString() !== 'transfer') return null;
+
+    const contractId = Address.fromScAddress(invocation.contractAddress()).toString();
+    const args = invocation.args();
+    const raw = args.length >= 3 ? scValToNative(args[2]!) : null;
+    const amount =
+      typeof raw === 'bigint'
+        ? raw
+        : typeof raw === 'number' && Number.isSafeInteger(raw)
+          ? BigInt(raw)
+          : null;
+    if (amount === null || amount < 0n) return null;
+
+    const known = knownSacLabel(contractId);
+    return {
+      operation: 'Token transfer',
+      asset: known ?? `Contract ${shortAddress(contractId)}`,
+      amount: known ? formatStroops(amount) : `${amount.toString()} raw units`,
+    };
+  }
+
+  // Never sign an operation whose effect cannot be represented faithfully in
+  // the mandatory native operation/asset/amount review.
+  return null;
 }
 
 function xdrParam(request: DappProviderRequest): string | null {
@@ -238,7 +273,7 @@ export async function processDappProviderRequest(
     return responseError(request.id, 'INVALID_PARAMS', 'A transaction XDR string is required.');
   }
 
-  let summary: { asset: string; amount: string };
+  let summary: SigningDescription | null;
   try {
     summary = (deps.describeXdr ?? describeSigningXdr)(xdrString);
   } catch {
@@ -248,10 +283,18 @@ export async function processDappProviderRequest(
       'Veil could not decode the transaction for review.',
     );
   }
+  if (!summary) {
+    return responseError(
+      request.id,
+      'UNREVIEWABLE_TRANSACTION',
+      'Veil will not sign a transaction it cannot fully describe.',
+    );
+  }
 
   const approved = await deps.requestApproval({
     origin: deps.approvedOrigin,
-    operation: request.method === 'signTransaction' ? 'Sign transaction' : 'Sign auth entry',
+    request: request.method === 'signTransaction' ? 'Sign transaction' : 'Sign auth entry',
+    operation: summary.operation,
     asset: summary.asset,
     amount: summary.amount,
   });
