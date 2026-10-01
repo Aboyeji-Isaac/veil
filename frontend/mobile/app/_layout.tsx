@@ -13,7 +13,7 @@ import * as SystemUI from 'expo-system-ui';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { BottomSheetModalProvider } from '@gorhom/bottom-sheet';
-import { StyleSheet } from 'react-native';
+import { AppState, StyleSheet } from 'react-native';
 
 import { fontAssets } from '../theme/typography';
 import { useTheme } from '../hooks/useTheme';
@@ -24,6 +24,7 @@ import { ConnectivityProvider, useConnectivity } from '../lib/connectivity';
 import { hydrateNetwork } from '../lib/network';
 import { registerActivityCheck } from '../lib/backgroundActivity';
 import { hydrateLockSettings } from '../lib/appLock';
+import { refreshVoiceSnapshot } from '../lib/voice/appIntents';
 import {
   configureNotificationChannel,
   configureNotificationHandler,
@@ -106,6 +107,7 @@ export default function RootLayout() {
               <InactivityLockGate />
               <NotificationGate />
               <LockStateTracker />
+              <VoiceSnapshotGate />
               <Stack
                 screenOptions={{
                   headerShown: false,
@@ -161,6 +163,30 @@ function LockStateTracker() {
   useEffect(() => {
     setAppLocked(segments[0] === 'lock');
   }, [segments]);
+  return null;
+}
+
+/**
+ * Keeps the read-only App Intents snapshot fresh while the app is active.
+ * The extension never calls Horizon, Lens, RPC, SecureStore wallet keys, or a
+ * signing path itself; it can only read this non-secret snapshot.
+ */
+function VoiceSnapshotGate() {
+  useEffect(() => {
+    const refresh = () => {
+      void refreshVoiceSnapshot().catch(() => {
+        // Voice data is best-effort. A failed refresh must never block the app
+        // or leak the underlying network/configuration error to Siri.
+      });
+    };
+
+    refresh();
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') refresh();
+    });
+    return () => subscription.remove();
+  }, []);
+
   return null;
 }
 
