@@ -28,7 +28,11 @@ function deps(overrides: Record<string, unknown> = {}) {
     getAddress: jest.fn(async () => 'C'.repeat(56)),
     signXdr: jest.fn(async () => 'SIGNED'),
     requestApproval: jest.fn(async () => true),
-    describeXdr: jest.fn(() => ({ asset: 'USDC · Circle', amount: '10' })),
+    describeXdr: jest.fn(() => ({
+      operation: 'Token transfer',
+      asset: 'USDC · Circle',
+      amount: '10',
+    })),
     ...overrides,
   };
 }
@@ -59,6 +63,15 @@ describe('dApp provider boundary', () => {
     const response = await processDappProviderRequest(request('getPrivateKey'), d);
 
     expect('error' in response && response.error.code).toBe('METHOD_NOT_FOUND');
+    expect(d.requestApproval).not.toHaveBeenCalled();
+    expect(d.signXdr).not.toHaveBeenCalled();
+  });
+
+  it('refuses an operation it cannot fully describe', async () => {
+    const d = deps({ describeXdr: jest.fn(() => null) });
+    const response = await processDappProviderRequest(request('signTransaction'), d);
+
+    expect('error' in response && response.error.code).toBe('UNREVIEWABLE_TRANSACTION');
     expect(d.requestApproval).not.toHaveBeenCalled();
     expect(d.signXdr).not.toHaveBeenCalled();
   });
