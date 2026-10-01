@@ -276,6 +276,21 @@ function addFrameworkOnce(project, framework, targetUuid) {
   if (!existing) project.addFramework(framework, { target: targetUuid });
 }
 
+function targetUuidByName(project, targetName) {
+  const section = project.pbxNativeTargetSection();
+  for (const [uuid, target] of Object.entries(section)) {
+    if (uuid.endsWith('_comment')) continue;
+    if (!target || typeof target !== 'object') continue;
+    const rawName = target.name;
+    const name =
+      typeof rawName === 'string'
+        ? rawName.replace(/^"|"$/g, '')
+        : '';
+    if (name === targetName) return uuid;
+  }
+  return null;
+}
+
 function withIosAppShortcuts(config) {
   const appBundleIdentifier = config.ios?.bundleIdentifier;
   if (!appBundleIdentifier) {
@@ -303,7 +318,7 @@ function withIosAppShortcuts(config) {
 
   config = withXcodeProject(config, (current) => {
     const project = current.modResults;
-    const existingUuid = project.findTargetKey(TARGET_NAME);
+    const existingUuid = targetUuidByName(project, TARGET_NAME);
     const target = existingUuid
       ? { uuid: existingUuid }
       : project.addTarget(
@@ -364,5 +379,6 @@ module.exports.renderSwift = renderSwift;
 module.exports.renderInfoPlist = renderInfoPlist;
 module.exports.renderEntitlements = renderEntitlements;
 module.exports.declareEasExtension = declareEasExtension;
+module.exports.targetUuidByName = targetUuidByName;
 module.exports.APP_GROUP = APP_GROUP;
 module.exports.TARGET_NAME = TARGET_NAME;
