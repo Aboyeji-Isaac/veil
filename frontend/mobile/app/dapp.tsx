@@ -325,7 +325,7 @@ export default function DappBrowserScreen() {
         title="Approve dApp signing?"
         message={
           signingPrompt
-            ? `Origin: ${signingPrompt.origin}\nOperation: ${signingPrompt.operation}\nAsset: ${signingPrompt.asset}\nAmount: ${signingPrompt.amount}`
+            ? `Origin: ${signingPrompt.origin}\nRequest: ${signingPrompt.request}\nOperation: ${signingPrompt.operation}\nAsset: ${signingPrompt.asset}\nAmount: ${signingPrompt.amount}`
             : ''
         }
         confirmLabel="Approve and sign"
