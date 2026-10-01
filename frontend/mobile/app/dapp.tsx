@@ -14,15 +14,16 @@
  * - `window.open` is neutralised in the page, and a popup can never become a
  *   second in-app context that inherits the opener's permissions.
  * - The address bar always shows the origin that is actually loaded.
- * - No wallet API, key or address is injected. This shell can browse and
- *   nothing more; a signing provider is a later, separate issue (V213).
+ * - The injected provider exposes only public address access and two signing
+ *   calls. Signing stays behind native approval and the existing wallet ceremony.
  */
 
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { WebView } from 'react-native-webview';
+import * as Crypto from 'expo-crypto';
 import type { WebViewMessageEvent, WebViewNavigation } from 'react-native-webview';
 import type { ShouldStartLoadRequest } from 'react-native-webview/lib/WebViewTypes';
 
@@ -32,6 +33,16 @@ import { FlowHeader } from '../components/FlowHeader';
 import { useTheme } from '../hooks/useTheme';
 import { openExternalUrl } from '../lib/about';
 import { getDappForUrl } from '../lib/dappAllowlist';
+import {
+  buildDappProviderJavaScript,
+  parseDappProviderRequest,
+  processDappProviderRequest,
+  providerResponseJavaScript,
+  type DappProviderResponse,
+  type SigningPrompt,
+} from '../lib/dappProvider';
+import { getWalletAddress } from '../lib/walletStore';
+import { signXdrPayload } from '../lib/walletConnect';
 import {
   chromeOrigin,
   decideNavigation,
@@ -58,11 +69,56 @@ export default function DappBrowserScreen() {
   const approvedOrigin = entry?.origin ?? null;
 
   const webRef = useRef<WebView>(null);
+  const providerBusyRef = useRef(false);
+  const approvalResolverRef = useRef<((approved: boolean) => void) | null>(null);
+  const providerToken = useMemo(() => Crypto.randomUUID(), []);
+  const providerScript = useMemo(
+    () => `${WINDOW_OPEN_BLOCKER_JS}\n${buildDappProviderJavaScript(providerToken)}`,
+    [providerToken],
+  );
   const [loadedUrl, setLoadedUrl] = useState<string | null>(null);
   const [pendingExternal, setPendingExternal] = useState<PendingExternal | null>(null);
+  const [signingPrompt, setSigningPrompt] = useState<SigningPrompt | null>(null);
   const [notice, setNotice] = useState<{ title: string; message: string } | null>(null);
 
   const shownOrigin = approvedOrigin ? chromeOrigin(approvedOrigin, loadedUrl) : '';
+
+  const sendProviderResponse = useCallback((response: DappProviderResponse) => {
+    webRef.current?.injectJavaScript(providerResponseJavaScript(response));
+  }, []);
+
+  const requestSigningApproval = useCallback(
+    (prompt: SigningPrompt): Promise<boolean> =>
+      new Promise((resolve) => {
+        // Only one signing prompt may own the native approval surface at once.
+        // processDappProviderRequest is serialized below, so this is defensive.
+        if (approvalResolverRef.current) {
+          resolve(false);
+          return;
+        }
+        approvalResolverRef.current = resolve;
+        setSigningPrompt(prompt);
+      }),
+    [],
+  );
+
+  const resolveSigningApproval = useCallback((approved: boolean) => {
+    const resolver = approvalResolverRef.current;
+    approvalResolverRef.current = null;
+    setSigningPrompt(null);
+    resolver?.(approved);
+  }, []);
+
+  useEffect(
+    () => () => {
+      // Leaving the screen is a rejection. Do not leave a promise, signature,
+      // or page request hanging behind a destroyed WebView.
+      const resolver = approvalResolverRef.current;
+      approvalResolverRef.current = null;
+      resolver?.(false);
+    },
+    [],
+  );
 
   const onShouldStartLoadWithRequest = useCallback(
     (request: ShouldStartLoadRequest): boolean => {
@@ -101,29 +157,66 @@ export default function DappBrowserScreen() {
   const onMessage = useCallback(
     (event: WebViewMessageEvent) => {
       if (!approvedOrigin) return;
-      const message = parseWindowOpenMessage(event.nativeEvent.data);
-      if (!message) return;
 
-      const decision = decidePopup(approvedOrigin, message.url);
-      if (decision.action === 'navigate') {
-        // Fold a same-origin popup back into this view rather than opening a
-        // second one that would share the opener's permissions.
-        const target = message.url;
-        webRef.current?.injectJavaScript(
-          `window.location.href = ${JSON.stringify(target)}; true;`,
-        );
+      const popup = parseWindowOpenMessage(event.nativeEvent.data);
+      if (popup) {
+        const decision = decidePopup(approvedOrigin, popup.url);
+        if (decision.action === 'navigate') {
+          const target = popup.url;
+          webRef.current?.injectJavaScript(
+            `window.location.href = ${JSON.stringify(target)}; true;`,
+          );
+          return;
+        }
+        if (decision.action === 'external') {
+          setPendingExternal({ origin: decision.origin, url: popup.url });
+          return;
+        }
+        setNotice({
+          title: 'Popup blocked',
+          message: 'This dApp tried to open a window Veil cannot allow.',
+        });
         return;
       }
-      if (decision.action === 'external') {
-        setPendingExternal({ origin: decision.origin, url: message.url });
+
+      const providerRequest = parseDappProviderRequest(event.nativeEvent.data);
+      if (!providerRequest) return;
+
+      if (providerBusyRef.current) {
+        sendProviderResponse({
+          id: providerRequest.id,
+          error: {
+            code: 'REQUEST_PENDING',
+            message: 'Another Veil provider request is awaiting review.',
+          },
+        });
         return;
       }
-      setNotice({
-        title: 'Popup blocked',
-        message: 'This dApp tried to open a window Veil cannot allow.',
-      });
+
+      providerBusyRef.current = true;
+      void processDappProviderRequest(providerRequest, {
+        approvedOrigin,
+        loadedUrl,
+        // react-native-webview reports the posting frame/source URL here. The
+        // capability token is an additional boundary for legacy Android.
+        sourceUrl: event.nativeEvent.url ?? '',
+        token: providerToken,
+        getAddress: getWalletAddress,
+        signXdr: signXdrPayload,
+        requestApproval: requestSigningApproval,
+      })
+        .then(sendProviderResponse)
+        .finally(() => {
+          providerBusyRef.current = false;
+        });
     },
-    [approvedOrigin],
+    [
+      approvedOrigin,
+      loadedUrl,
+      providerToken,
+      requestSigningApproval,
+      sendProviderResponse,
+    ],
   );
 
   const confirmExternal = useCallback(() => {
@@ -187,8 +280,10 @@ export default function DappBrowserScreen() {
         onShouldStartLoadWithRequest={onShouldStartLoadWithRequest}
         onNavigationStateChange={onNavigationStateChange}
         onMessage={onMessage}
-        injectedJavaScriptBeforeContentLoaded={WINDOW_OPEN_BLOCKER_JS}
-        injectedJavaScript={WINDOW_OPEN_BLOCKER_JS}
+        injectedJavaScriptBeforeContentLoaded={providerScript}
+        injectedJavaScript={providerScript}
+        injectedJavaScriptBeforeContentLoadedForMainFrameOnly
+        injectedJavaScriptForMainFrameOnly
         // No second in-app window may be created from page JavaScript.
         setSupportMultipleWindows={false}
         javaScriptCanOpenWindowsAutomatically={false}
@@ -223,6 +318,21 @@ export default function DappBrowserScreen() {
         cancelLabel="Stay here"
         onConfirm={confirmExternal}
         onCancel={() => setPendingExternal(null)}
+      />
+
+      <ConfirmModal
+        isOpen={signingPrompt !== null}
+        title="Approve dApp signing?"
+        message={
+          signingPrompt
+            ? `Origin: ${signingPrompt.origin}\nOperation: ${signingPrompt.operation}\nAsset: ${signingPrompt.asset}\nAmount: ${signingPrompt.amount}`
+            : ''
+        }
+        confirmLabel="Approve and sign"
+        cancelLabel="Reject"
+        destructive
+        onConfirm={() => resolveSigningApproval(true)}
+        onCancel={() => resolveSigningApproval(false)}
       />
 
       <NoticeModal
