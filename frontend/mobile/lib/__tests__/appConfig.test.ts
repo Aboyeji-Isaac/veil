@@ -174,3 +174,46 @@ describe('apple-app-site-association agrees with the entitlement', () => {
         }
     });
 });
+
+
+describe('app.config.ts — iOS App Intents extension', () => {
+  const iosExperimental = (
+    config.extra as {
+      eas?: {
+        build?: {
+          experimental?: {
+            ios?: {
+              appExtensions?: Array<{
+                targetName: string;
+                bundleIdentifier: string;
+                entitlements?: Record<string, unknown>;
+              }>;
+            };
+          };
+        };
+      };
+    }
+  )?.eas?.build?.experimental?.ios;
+
+  it('declares the extension before prebuild so EAS can provision it', () => {
+    expect(iosExperimental?.appExtensions).toContainEqual(
+      expect.objectContaining({
+        targetName: 'VeilAppIntents',
+        bundleIdentifier: 'xyz.veil.wallet.appintents',
+      }),
+    );
+  });
+
+  it('shares only the read-only voice app group with the extension', () => {
+    const extension = iosExperimental?.appExtensions?.find(
+      (entry) => entry.targetName === 'VeilAppIntents',
+    );
+    expect(extension?.entitlements).toEqual({
+      'com.apple.security.application-groups': ['group.xyz.veil.wallet.voice'],
+    });
+  });
+
+  it('keeps the config plugin registered', () => {
+    expect(config.plugins).toContain('./plugins/withIosAppShortcuts');
+  });
+});
