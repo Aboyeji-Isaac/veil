@@ -179,6 +179,23 @@ const config: ExpoConfig = {
   extra: {
     eas: {
       projectId: '829ef278-f408-43ee-baf7-e0022a6e6736',
+      build: {
+        experimental: {
+          ios: {
+            // CNG cannot discover extension targets until prebuild. Declaring
+            // it here lets EAS provision the .appex before Xcode is generated.
+            appExtensions: [
+              {
+                targetName: 'VeilAppIntents',
+                bundleIdentifier: `${BUNDLE_IDENTIFIER}.appintents`,
+                entitlements: {
+                  'com.apple.security.application-groups': ['group.xyz.veil.wallet.voice'],
+                },
+              },
+            ],
+          },
+        },
+      },
     },
   },
 };
